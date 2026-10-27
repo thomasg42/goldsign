@@ -1,4 +1,6 @@
 // Signer page. No account: the link's code (after #t=) is the key. Built for a phone first.
+// The signer taps straight into their boxes on the document and types, then taps Finish at the bottom.
+// #c=<code> opens the download page for a finished document instead (the link in the signed-copy email).
 
 import { ApiError, api, timezone } from './api.js';
 import { CONFIG } from './config.js';
@@ -6,11 +8,14 @@ import { h, layoutFor, renderPages, renderReader } from './render.js';
 import { FIELD_TYPES, displayValue, formatDate, isImageType, validateValue } from './shared/fields.js';
 import { readingOrder } from './shared/layout.js';
 import { sha256Hex } from './shared/canon.js';
+import { firstName, joinNames } from './shared/order.js';
 import { SCRIPT_FONTS, drawPad, typedPng } from './sigpad.js';
-import { savePdf } from './download.js';
+import { pdfForEmail, savePdf } from './download.js';
 
 const root = document.getElementById('app');
-const token = new URLSearchParams(location.hash.slice(1)).get('t') || '';
+const params = new URLSearchParams(location.hash.slice(1));
+const token = params.get('t') || '';
+const copyToken = params.get('c') || '';
 
 const S = {
   session: null,
@@ -35,12 +40,6 @@ function screen(...children) {
 
 function message(title, text, ...extra) {
   screen(h('div', { class: 'card center' }, h('h1', { text: title }), h('p', { class: 'big-note', text }), ...extra));
-}
-
-function toast(text) {
-  const t = h('div', { class: 'toast', role: 'status', text });
-  document.body.append(t);
-  setTimeout(() => t.remove(), 2600);
 }
 
 // ---------- draft answers kept on this phone until signing ----------
@@ -72,13 +71,14 @@ function clearDraft() {
 // ---------- helpers ----------
 
 const has = (f, v) => !(v === undefined || v === null || v === '' || (f.type === 'checkbox' && v !== true) || (isImageType(f.type) && !v?.png));
+const needed = (f) => f.required || f.type === 'signature';
 const done = (f) => {
   if (f.type === 'date' && !f.allowChange) return true;
-  if (!f.required && f.type !== 'signature') return S.answers[f.n] !== undefined;
+  if (!needed(f)) return S.answers[f.n] !== undefined && (!has(f, S.answers[f.n]) || validateValue(f, S.answers[f.n]).ok);
   return has(f, S.answers[f.n]) && validateValue(f, S.answers[f.n]).ok;
 };
 const doneCount = () => S.mine.filter(done).length;
-const allRequiredDone = () => S.mine.every((f) => (f.required || f.type === 'signature' ? done(f) : true));
+const allRequiredDone = () => S.mine.every((f) => (needed(f) ? done(f) : !has(f, S.answers[f.n]) || validateValue(f, S.answers[f.n]).ok));
 const mergedValues = () => {
   const v = { ...S.session.values };
   for (const f of S.mine) {
@@ -88,9 +88,28 @@ const mergedValues = () => {
   return v;
 };
 
+// Who the finished document goes to next, in the button's own words.
+function finishLabel() {
+  const after = S.session.after_me;
+  if (after) return after.is_owner ? `Finish and send back to ${firstName(after.name)}` : `Finish and send to ${firstName(after.name)}`;
+  const others = S.session.roles.filter((r) => r.role !== S.session.signer.role).map((r) => firstName(r.name));
+  return others.length ? `Finish and send to ${joinNames(others)}` : 'Finish';
+}
+
+function whatHappensNext() {
+  const s = S.session;
+  const by = s.mail ? ' by email' : '';
+  const after = s.after_me;
+  if (after?.is_owner) return `This signs the document with the mark you made and sends it back to ${firstName(after.name)}. When ${firstName(after.name)} signs, you both get the signed copy${by}.`;
+  if (after) return `This signs the document with the mark you made and sends it to ${after.name} to sign. Everyone gets the signed copy${by} at the end.`;
+  const others = s.roles.filter((r) => r.role !== s.signer.role).map((r) => firstName(r.name));
+  return `This finishes the document. ${others.length ? `${joinNames(others)} and you get` : 'You get'} the signed PDF${by}.`;
+}
+
 // ---------- start ----------
 
 async function start() {
+  if (copyToken) return startCopy();
   if (!token) {
     message('This link is incomplete', 'The signing code is missing from the link. Open the link exactly as it was sent to you, or ask the sender for a new one.');
     return;
@@ -115,7 +134,7 @@ async function start() {
   const draft = loadDraft();
   for (const f of S.mine) {
     if (draft[f.n] !== undefined) S.answers[f.n] = draft[f.n];
-    else if (f.prefill !== undefined) S.answers[f.n] = f.prefill;
+    else if (f.prefill !== undefined) S.answers[f.n] = f.prefill; // what the sender pre-filled is already in the box
     else if (f.type === 'date') S.answers[f.n] = S.session.today;
   }
   showMain();
@@ -123,21 +142,18 @@ async function start() {
 
 // ---------- main document screen ----------
 
-function showMain() {
+function showMain({ keepScroll = false } = {}) {
+  const y = window.scrollY || 0;
   const doc = S.session.document;
-  const count = S.mine.length;
+  const count = S.mine.filter((f) => !(f.type === 'date' && !f.allowChange)).length;
+  const from = S.session.is_owner ? '' : `${S.session.owner_name || S.session.sender_name || 'The sender'} sent you this document to sign. `;
   const intro = !S.started
     ? h(
         'div',
         { class: 'card' },
-        h('p', { class: 'big-note' }, `${S.session.sender_name || 'The sender'} sent you this document to sign.`),
-        h('p', {}, `You have ${count} ${count === 1 ? 'item' : 'items'} to fill in. Then you review everything and sign. It takes about two minutes.`),
-        h(
-          'div',
-          { class: 'row' },
-          h('button', { class: 'btn primary', type: 'button', onclick: () => ((S.started = true), nextField()) }, 'Start'),
-          h('button', { class: 'btn', type: 'button', onclick: () => ((S.started = true), showMain()) }, 'Read it first'),
-        ),
+        h('p', { class: 'big-note' }, S.session.is_owner ? 'Your turn to sign.' : `${from.trim()}`),
+        h('p', {}, `Your boxes are outlined in color. Tap a box and type, tick or sign. ${count} ${count === 1 ? 'box needs' : 'boxes need'} you. Then tap "${finishLabel()}" at the bottom.`),
+        h('div', { class: 'row' }, h('button', { class: 'btn primary', type: 'button', onclick: () => focusNext() }, 'Start')),
       )
     : null;
   const viewSwitch = h(
@@ -161,7 +177,7 @@ function showMain() {
   );
   const isMine = (f) => f.role === S.session.signer.role;
   if (S.view === 'text') {
-    renderReader(docEl, doc.body, doc.fields, S.layout, { roles: S.session.roles.map((r) => r.role), values: mergedValues(), isMine, onTap: openField });
+    renderReader(docEl, doc.body, doc.fields, S.layout, { roles: S.session.roles.map((r) => r.role), values: mergedValues(), isMine, mineEl: inlineField });
   } else {
     renderPages(docEl, S.layout, doc.fields, { roles: S.session.roles.map((r) => r.role), values: mergedValues(), isMine, showEmpty: true, title: doc.title });
     docEl.addEventListener('click', (e) => {
@@ -170,6 +186,86 @@ function showMain() {
       if (f) openField(f);
     });
   }
+  stickyBar();
+  if (keepScroll) window.scrollTo(0, y);
+}
+
+// ---------- the signer's own boxes, typed into in place ----------
+
+const INLINE_WIDTH = { email: '16em', phone: '9.5em', full_name: '12em', company: '12em', free_text: '12em', date: '10.5em' };
+
+function inlineField(f) {
+  const v = S.answers[f.n];
+  const label = f.label || FIELD_TYPES[f.type].prompt;
+  if (f.type === 'date' && !f.allowChange) {
+    return h('span', { class: 'fchip done', 'data-n': f.n, title: label }, `${formatDate(S.session.today)} (today)`);
+  }
+  if (f.type === 'checkbox') {
+    const c = h('input', { type: 'checkbox', 'aria-label': label });
+    c.checked = v === true;
+    const text = h('span', { text: c.checked ? 'Ticked' : 'Tap to tick' });
+    const el = h('label', { class: `fchip tick${c.checked ? ' done' : ''}`, 'data-n': f.n }, c, text);
+    c.addEventListener('change', () => {
+      S.answers[f.n] = c.checked;
+      text.textContent = c.checked ? 'Ticked' : 'Tap to tick';
+      el.classList.toggle('done', c.checked);
+      changed(f);
+    });
+    return el;
+  }
+  if (isImageType(f.type) || f.type === 'address') {
+    // A mark or a whole address needs more room than a line of text: these open a panel.
+    const filled = has(f, v);
+    const inner = filled && isImageType(f.type) ? h('img', { src: v.png, alt: label }) : h('span', { text: filled ? displayValue(f, validateValue(f, v).value ?? v) : label });
+    const el = h('button', { class: `fchip ${filled ? 'done' : 'todo'}`, type: 'button', 'data-n': f.n }, inner);
+    el.addEventListener('click', () => openField(f));
+    return el;
+  }
+  const type = { email: 'email', phone: 'tel', date: 'date' }[f.type] || 'text';
+  const attrs = {
+    full_name: { autocomplete: 'name', autocapitalize: 'words' },
+    company: { autocomplete: 'organization' },
+    email: { autocomplete: 'email', inputmode: 'email', autocapitalize: 'off', spellcheck: 'false' },
+    phone: { autocomplete: 'tel', inputmode: 'tel' },
+  }[f.type] || {};
+  const multi = f.type === 'free_text' && f.multiline;
+  const input = multi ? h('textarea', { rows: '3', maxlength: f.maxLength || null }) : h('input', { type, ...attrs, maxlength: f.maxLength || null });
+  input.value = typeof v === 'string' ? v : '';
+  input.setAttribute('aria-label', label);
+  if (type !== 'date') input.setAttribute('placeholder', label);
+  if (!multi) input.style.width = INLINE_WIDTH[f.type] || '12em';
+  const err = h('span', { class: 'ferr', role: 'alert', text: S.errors[f.n] || '' });
+  const el = h('span', { class: `fchip fin${multi ? ' multi' : ''}${S.errors[f.n] ? ' bad' : ''}${done(f) && has(f, v) ? ' done' : ''}`, 'data-n': f.n }, input, err);
+  const check = () => {
+    const value = S.answers[f.n];
+    const result = has(f, value) ? validateValue(f, value) : { ok: true };
+    if (result.ok) delete S.errors[f.n];
+    else S.errors[f.n] = result.error;
+    err.textContent = S.errors[f.n] || '';
+    el.classList.toggle('bad', Boolean(S.errors[f.n]));
+    el.classList.toggle('done', done(f) && has(f, value));
+  };
+  input.addEventListener('input', () => {
+    S.answers[f.n] = input.value;
+    if (S.errors[f.n]) check();
+    else el.classList.toggle('done', done(f) && has(f, input.value));
+    changed(f);
+  });
+  input.addEventListener('blur', check);
+  input.addEventListener('change', check);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !multi) {
+      e.preventDefault();
+      check();
+      focusNext(f);
+    }
+  });
+  return el;
+}
+
+function changed() {
+  S.started = true;
+  saveDraft();
   stickyBar();
 }
 
@@ -183,21 +279,46 @@ function stickyBar() {
     { class: 'sticky-bar' },
     h('div', { class: 'progress' }, `${n} of ${total} done`, h('div', { class: 'bar' }, h('span', { style: { width: `${total ? (n / total) * 100 : 100}%` } }))),
     ready
-      ? h('button', { class: 'btn primary', type: 'button', onclick: showReview }, 'Review and sign')
-      : h('button', { class: 'btn primary', type: 'button', onclick: () => ((S.started = true), nextField()) }, n ? 'Next' : 'Start'),
+      ? h('button', { class: 'btn primary finish', type: 'button', onclick: openFinish }, finishLabel())
+      : h('button', { class: 'btn primary', type: 'button', onclick: () => focusNext() }, n ? 'Next' : 'Start'),
   );
   document.body.append(bar);
 }
 
-function nextField(after) {
+// Takes the signer to the next box that still needs them: the cursor goes in, or the panel opens.
+function focusNext(after) {
+  S.started = true;
   const order = S.mine;
   const startAt = after ? order.findIndex((f) => f.n === after.n) + 1 : 0;
-  const pick = [...order.slice(startAt), ...order.slice(0, startAt)].find((f) => !done(f));
-  if (pick) openField(pick, { chain: true });
-  else showReview();
+  const pick = [...order.slice(startAt), ...order.slice(0, startAt)].find((f) => !done(f) || S.errors[f.n]);
+  if (!pick) {
+    document.activeElement?.blur?.();
+    stickyBar();
+    return;
+  }
+  goTo(pick);
 }
 
-// ---------- the field sheet ----------
+function goTo(f) {
+  if (S.view !== 'text') {
+    openField(f, { chain: true });
+    return;
+  }
+  const el = document.querySelector(`#doc [data-n="${f.n}"]`);
+  if (!el) {
+    openField(f, { chain: true });
+    return;
+  }
+  el.scrollIntoView?.({ block: 'center', behavior: 'smooth' });
+  const input = el.querySelector('input, textarea');
+  if (input && input.type !== 'checkbox') input.focus?.({ preventScroll: true });
+  else if (input) {
+    el.classList.add('current');
+    setTimeout(() => el.classList.remove('current'), 1600);
+  } else openField(f, { chain: true });
+}
+
+// ---------- the panel for marks, addresses and the page view ----------
 
 let sheetCleanup = null;
 function closeSheet() {
@@ -332,15 +453,16 @@ function openField(f, { chain = false } = {}) {
     }
     S.answers[f.n] = check.value;
     delete S.errors[f.n];
+    S.started = true;
     saveDraft();
     input.cleanup?.();
     closeSheet();
-    showMain();
-    if (chain) nextField(f);
+    showMain({ keepScroll: true });
+    if (chain) focusNext(f);
   };
   const sheet = openSheet(
     prompt,
-    h('div', {}, h('p', { class: 'hint' }, `Item ${index} of ${S.mine.length}  |  ${f.required || f.type === 'signature' ? 'Required' : 'Optional'}`), input.el, err),
+    h('div', {}, h('p', { class: 'hint' }, `Item ${index} of ${S.mine.length}  |  ${needed(f) ? 'Required' : 'Optional'}`), input.el, err),
     [
       h('button', { class: 'btn', type: 'button', onclick: () => (input.cleanup?.(), closeSheet()) }, 'Cancel'),
       h('button', { class: 'btn primary', type: 'button', onclick: save }, chain ? 'Save and next' : 'Save'),
@@ -354,52 +476,29 @@ function openField(f, { chain = false } = {}) {
   });
 }
 
-// ---------- review, consent, sign ----------
+// ---------- finish: consent, sign, send on ----------
 
-function answerView(f) {
-  const v = f.type === 'date' && !f.allowChange ? S.session.today : S.answers[f.n];
-  if (!has(f, v)) return h('span', { class: f.required || f.type === 'signature' ? 'error' : 'hint', text: f.required || f.type === 'signature' ? 'Not filled in yet' : 'Left blank' });
-  if (isImageType(f.type)) return h('img', { src: v.png, alt: 'Your mark' });
-  return h('span', { text: f.type === 'checkbox' ? 'Yes' : displayValue(f, v) });
-}
-
-function showReview() {
-  document.querySelector('.sticky-bar')?.remove();
+function openFinish() {
+  const missing = S.mine.find((f) => (needed(f) && !done(f)) || S.errors[f.n]);
+  if (missing) {
+    goTo(missing);
+    return;
+  }
+  const label = finishLabel();
   const consentBox = h('input', { type: 'checkbox', id: 'consent' });
-  const signBtn = h('button', { class: 'btn primary', type: 'button', disabled: true }, 'Sign');
+  const btn = h('button', { class: 'btn primary', type: 'button', disabled: true }, label);
   const err = h('p', { class: 'error', role: 'alert' });
-  const ready = allRequiredDone();
   consentBox.addEventListener('change', () => {
-    signBtn.disabled = !(consentBox.checked && allRequiredDone());
+    btn.disabled = !consentBox.checked;
   });
-  signBtn.addEventListener('click', () => submit(signBtn, err));
-  screen(
-    h('h1', { text: 'Review and sign' }),
-    h('p', { class: 'hint', text: S.session.document.title }),
-    h(
-      'div',
-      { class: 'card' },
-      h(
-        'ul',
-        { class: 'review-list' },
-        ...S.mine.map((f) =>
-          h(
-            'li',
-            {},
-            h('div', {}, h('span', { class: 'q', text: f.label || FIELD_TYPES[f.type].label }), answerView(f), S.errors[f.n] ? h('span', { class: 'error', text: ` ${S.errors[f.n]}` }) : null),
-            f.type === 'date' && !f.allowChange ? null : h('button', { class: 'btn small', type: 'button', onclick: () => openField(f) }, 'Change'),
-          ),
-        ),
-      ),
-    ),
-    ready ? null : h('p', { class: 'error', text: 'Some required items are still empty. Tap Change next to each one.' }),
-    h('label', { class: 'consent', for: 'consent' }, consentBox, h('span', { text: S.session.consent.text })),
-    err,
-    h('div', { class: 'row' }, h('button', { class: 'btn', type: 'button', onclick: showMain }, 'Back to the document'), signBtn),
-  );
+  btn.addEventListener('click', () => submit(btn, err, label));
+  openSheet(label, h('div', {}, h('p', { text: whatHappensNext() }), h('label', { class: 'consent', for: 'consent' }, consentBox, h('span', { text: S.session.consent.text })), err), [
+    h('button', { class: 'btn', type: 'button', onclick: closeSheet }, 'Back'),
+    btn,
+  ]);
 }
 
-async function submit(btn, err) {
+async function submit(btn, err, label) {
   btn.disabled = true;
   btn.textContent = 'Signing...';
   err.textContent = '';
@@ -414,12 +513,15 @@ async function submit(btn, err) {
   } catch (e) {
     if (e instanceof ApiError && e.body.fieldErrors) {
       S.errors = e.body.fieldErrors;
-      showReview();
+      closeSheet();
+      showMain({ keepScroll: true });
+      const first = S.mine.find((f) => S.errors[f.n]);
+      if (first) goTo(first);
       return;
     }
     err.textContent = e.message || 'Signing failed. Try again.';
     btn.disabled = false;
-    btn.textContent = 'Sign';
+    btn.textContent = label;
   }
 }
 
@@ -427,38 +529,92 @@ async function submit(btn, err) {
 
 function showSigned(justNow = false) {
   document.querySelector('.sticky-bar')?.remove();
-  const complete = S.session.document.status === 'signed';
+  const s = S.session;
+  const complete = s.document.status === 'signed';
   const out = h('div');
-  const waiting = S.session.roles.filter((r) => r.status !== 'signed');
+  const back = s.app_url ? h('p', { style: { marginTop: '14px' } }, h('a', { class: 'btn', href: s.app_url }, 'Back to your documents')) : null;
+  if (!complete) {
+    const who = s.waiting_on;
+    const name = who ? (who.is_owner ? firstName(who.name) : who.name) : 'the others';
+    screen(
+      h(
+        'div',
+        { class: 'card center' },
+        h('h1', { text: justNow ? `Done. Sent ${who?.is_owner ? 'back ' : ''}to ${name}.` : 'You already signed this' }),
+        h('p', { class: 'big-note', text: s.mail ? `When ${name} signs, you get the signed copy by email. This same link also downloads it then.` : `Waiting on ${name}. Open this same link later to download the signed copy.` }),
+        h('button', { class: 'btn', type: 'button', onclick: start }, 'Check again'),
+        back,
+      ),
+    );
+    return;
+  }
+  const both = s.roles.length === 2 ? 'both parties' : 'everyone';
+  const note = h('p', { class: 'big-note', text: s.mail && justNow ? 'Emailing the signed PDF...' : 'Download your copy below and keep it.' });
   screen(
     h(
       'div',
       { class: 'card center' },
-      h('h1', { text: justNow ? 'Signed. Thank you.' : 'You already signed this' }),
-      complete
-        ? h('p', { class: 'big-note', text: 'Everyone has signed. Download your copy below and keep it.' })
-        : h('p', { class: 'big-note', text: `Waiting on ${waiting.map((r) => `${r.name} (${r.role})`).join(' and ')}. Open this same link later to download the signed copy.` }),
-      complete
-        ? h('button', { class: 'btn gold', type: 'button', onclick: () => download(out) }, 'Download signed PDF')
-        : h('button', { class: 'btn', type: 'button', onclick: start }, 'Check again'),
+      h('h1', { text: justNow ? `Finished. Signed by ${both}.` : `Signed by ${both}` }),
+      note,
+      h('button', { class: 'btn gold', type: 'button', onclick: () => download(out, () => api('GET', '/api/sign/record', { signToken: token })) }, 'Download or print the PDF'),
       out,
+      back,
     ),
   );
+  if (justNow && s.mail) emailCopies(note);
 }
 
-async function download(out) {
-  out.replaceChildren(h('p', { class: 'hint', text: 'Building your PDF...' }));
+// The last signer's phone builds the finished PDF and hands it over, so the copy emails carry it.
+async function emailCopies(note) {
   try {
     const { record } = await api('GET', '/api/sign/record', { signToken: token });
+    const { pdf_b64 } = await pdfForEmail(record);
+    const r = await api('POST', '/api/sign/copy', { signToken: token, body: { pdf_b64 } });
+    const to = r.emailed.filter((e) => e.ok).map((e) => e.to);
+    note.textContent = to.length ? `Emailed the signed copy to ${joinNames(to)}.` : 'Everyone gets the signed copy by email.';
+  } catch {
+    note.textContent = 'The signed copies go out by email in a few minutes. You can download yours now.';
+  }
+}
+
+async function download(out, getRecord) {
+  out.replaceChildren(h('p', { class: 'hint', text: 'Building your PDF...' }));
+  try {
+    const { record } = await getRecord();
     const { hash, url } = await savePdf(record);
     out.replaceChildren(
       h('p', {}, h('a', { href: url, target: '_blank', rel: 'noopener' }, 'Open the PDF'), ' if the download did not start.'),
-      h('p', { class: 'hint', text: 'File fingerprint (SHA-256). Both copies show the same one:' }),
+      h('p', { class: 'hint', text: 'File fingerprint (SHA-256). Every copy shows the same one:' }),
       h('p', { class: 'mono', text: hash }),
     );
   } catch (e) {
     out.replaceChildren(h('p', { class: 'error', text: e.message || 'Could not build the PDF.' }));
   }
+}
+
+// ---------- download page for a finished document (#c=) ----------
+
+async function startCopy() {
+  screen(h('p', { class: 'center big-note', text: 'Opening your signed copy...' }));
+  let record;
+  try {
+    ({ record } = await api('GET', '/api/copy/record', { copyToken }));
+  } catch (err) {
+    message('This link cannot be used', err instanceof ApiError ? err.message : 'Something went wrong. Try again.');
+    return;
+  }
+  document.title = `${record.title} | ${CONFIG.APP_NAME}`;
+  const out = h('div');
+  screen(
+    h(
+      'div',
+      { class: 'card center' },
+      h('h1', { text: record.title }),
+      h('p', { class: 'big-note', text: `Signed by ${joinNames((record.signers || []).map((s) => s.name))}.` }),
+      h('button', { class: 'btn gold', type: 'button', onclick: () => download(out, async () => ({ record })) }, 'Download the signed PDF'),
+      out,
+    ),
+  );
 }
 
 // ---------- decline ----------

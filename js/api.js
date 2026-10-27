@@ -27,11 +27,12 @@ export function setOwnerToken(token) {
   }
 }
 
-export async function api(method, path, { body, signToken, owner = !signToken } = {}) {
+export async function api(method, path, { body, signToken, copyToken, owner = !signToken && !copyToken } = {}) {
   const headers = {};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (owner && ownerToken()) headers.Authorization = `Bearer ${ownerToken()}`;
   if (signToken) headers['X-Sign-Token'] = signToken;
+  if (copyToken) headers['X-Copy-Token'] = copyToken;
   let res;
   try {
     res = await fetch(`${CONFIG.API_BASE}${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), referrerPolicy: 'no-referrer' });

@@ -1,5 +1,5 @@
-// Sender app: sign in with the owner PIN, write or pick a document, drop fields on it, send links,
-// watch the status and download the signed PDF.
+// Sender app: sign in with the owner PIN, write or pick a document, drop fields on it, tap Finish document,
+// send it to the client by email, sign last, and keep the finished copies.
 
 import { ApiError, api, ownerToken, setOwnerToken } from './api.js';
 import { CONFIG } from './config.js';
@@ -7,8 +7,9 @@ import { SENDER_COLOR, h, layoutFor, renderPages, roleColor } from './render.js'
 import { FIELD_TYPES, SENDER_ROLE, TYPE_KEYS, formatUtc, isImageType } from './shared/fields.js';
 import { PAGE, fieldRect, replaceFieldToken, replaceNthBlank } from './shared/layout.js';
 import { sendProblems } from './shared/rules.js';
+import { firstName, isOwnerSigner, joinNames, signingOrder } from './shared/order.js';
 import { describeEvent } from './shared/pdf.js';
-import { savePdf } from './download.js';
+import { pdfForEmail, savePdf } from './download.js';
 
 const root = document.getElementById('app');
 
@@ -29,6 +30,10 @@ const A = {
   links: [],
   ai: null,
   aiBusy: false,
+  owner: { email: '', name: '' },
+  mailReady: false,
+  outbox: [],
+  copies: [],
 };
 
 // ---------- small UI helpers ----------
@@ -141,30 +146,52 @@ async function showList() {
     fail(e);
     return;
   }
+  const piles = PILES.map(([stage, title]) => [title, A.docs.filter((d) => (d.stage || 'draft') === stage)]).filter(([, docs]) => docs.length);
   const list = A.docs.length
-    ? h(
-        'ul',
-        { class: 'doc-list' },
-        ...A.docs.map((d) =>
-          h(
-            'li',
-            {},
+    ? piles.flatMap(([title, docs]) => [
+        h('h2', { class: 'pile' }, title, h('span', { class: 'count', text: String(docs.length) })),
+        h(
+          'ul',
+          { class: 'doc-list' },
+          ...docs.map((d) =>
             h(
-              'button',
-              { type: 'button', onclick: () => go(`#/doc/${d.id}`) },
-              h('span', { class: 'title', text: d.title }),
-              h('span', { class: 'meta' }, statusChip(d.display_status), '  ', d.signers.map((s) => `${s.name || s.role} (${s.status})`).join(', ')),
-              h('span', { class: 'meta', style: { display: 'block' }, text: `Updated ${when(d.updated_at)}` }),
+              'li',
+              {},
+              h(
+                'button',
+                { type: 'button', onclick: () => go(`#/doc/${d.id}`) },
+                h('span', { class: 'title', text: d.title }),
+                h('span', { class: 'meta' }, statusChip(d.display_status), '  ', nextStep(d)),
+                h('span', { class: 'meta', style: { display: 'block' }, text: d.stage === 'finished' ? `Signed ${when(d.completed_at)}` : `Updated ${when(d.updated_at)}` }),
+              ),
             ),
           ),
         ),
-      )
-    : h('p', { class: 'card', text: 'No documents yet. Start one from a template or a blank page.' });
+      ])
+    : [h('p', { class: 'card', text: 'No documents yet. Start one from a template or a blank page.' })];
   screen(
     [h('button', { class: 'btn small', type: 'button', onclick: logout }, 'Sign out')],
-    h('div', { class: 'row', style: { justifyContent: 'space-between', marginTop: '12px' } }, h('h1', { text: 'Documents' }), h('button', { class: 'btn primary', type: 'button', onclick: newDocument }, 'New document')),
-    list,
+    h('div', { class: 'row', style: { justifyContent: 'space-between', marginTop: '12px' } }, h('h1', { text: 'All documents' }), h('button', { class: 'btn primary', type: 'button', onclick: newDocument }, 'New document')),
+    ...list,
   );
+}
+
+// The piles on the document list, in this order. Empty piles are hidden.
+const PILES = [
+  ['your_turn', 'Your turn to sign'],
+  ['draft', 'New documents'],
+  ['waiting', 'Out for signing'],
+  ['finished', 'Finished: signed by both parties'],
+  ['stopped', 'Declined, voided or expired'],
+];
+
+function nextStep(d) {
+  const signedOthers = d.signers.filter((s) => s.status === 'signed' && !s.is_owner).map((s) => s.name);
+  if (d.stage === 'your_turn') return signedOthers.length ? `${joinNames(signedOthers)} signed. Your turn.` : 'Your turn.';
+  if (d.stage === 'waiting') return d.next ? `Waiting on ${d.next.name}` : 'Out for signing';
+  if (d.stage === 'finished') return `Signed by ${joinNames(d.signers.map((s) => s.name))}`;
+  if (d.stage === 'draft') return 'Not sent yet';
+  return '';
 }
 
 function newDocument() {
@@ -221,6 +248,10 @@ function loadDocResponse(r) {
   A.doc = r.document;
   A.values = r.values;
   A.events = r.events;
+  A.owner = r.owner || A.owner;
+  A.mailReady = Boolean(r.mail_ready);
+  A.outbox = r.outbox || [];
+  A.copies = r.copies || [];
   A.draft = {
     title: r.document.title,
     body: r.document.body,
@@ -237,6 +268,8 @@ async function relayout() {
 
 const roles = () => A.draft.signers.map((s) => s.role);
 const senderValueMap = () => Object.fromEntries(A.draft.fields.filter((f) => f.role === SENDER_ROLE && f.value !== undefined).map((f) => [f.n, f.value]));
+// What the builder shows in each box: your filled-in terms, plus what a signer's box starts with.
+const boxValueMap = () => ({ ...Object.fromEntries(A.draft.fields.filter((f) => f.role !== SENDER_ROLE && f.prefill !== undefined).map((f) => [f.n, f.prefill])), ...senderValueMap() });
 const nextN = () => A.draft.fields.reduce((m, f) => Math.max(m, f.n), 0) + 1;
 
 // ---------- saving ----------
@@ -293,9 +326,19 @@ function paintSaveState() {
 
 // ---------- document screen ----------
 
+// The bottom of every draft tab: one button that checks every box and moves on to sending.
+async function finishDocument() {
+  await saveNow();
+  go(`#/doc/${A.doc.id}/send`);
+}
+
+function finishBar() {
+  return h('div', { class: 'finish-bar' }, h('button', { class: 'btn primary wide', type: 'button', onclick: finishDocument }, 'Finish document'));
+}
+
 function renderDoc() {
   const d = A.doc;
-  const tabs = d.status === 'draft' ? [['text', 'Text'], ['fields', 'Fields'], ['signers', 'Signers'], ['send', 'Send']] : [];
+  const tabs = d.status === 'draft' ? [['text', 'Text'], ['fields', 'Fields'], ['signers', 'Signers'], ['send', 'Finish']] : [];
   const tabBar = tabs.length
     ? h(
         'div',
@@ -321,6 +364,7 @@ function renderDoc() {
   );
   paintSaveState();
   ({ text: renderText, fields: renderFields, signers: renderSigners, send: renderSend, status: renderStatus })[A.tab](body);
+  if (d.status === 'draft' && A.tab !== 'send') body.append(finishBar());
 }
 
 // ---------- Text tab ----------
@@ -527,7 +571,7 @@ async function fillEveryBlank() {
 
 function renderFields(body) {
   body.append(
-    h('p', { class: 'hint', text: 'Pick who fills it, then tap a field type and tap the page or a blank line where it goes. You can also drag a type onto the page. Tap a box to edit it. Drag a box to move it.' }),
+    h('p', { class: 'hint', text: 'Pick who fills it, then tap a field type and tap the page or a blank line where it goes. You can also drag a type onto the page. Tap a box to edit it. Drag a box to move it. Gold boxes are yours to fill in now: what a box shows is what prints. When every box is right, tap Finish document at the bottom.' }),
     h('div', { id: 'builder-controls' }),
     h('div', { class: 'pages', id: 'builder-pages' }),
   );
@@ -566,13 +610,18 @@ function paintBuilder() {
       [2, '200%'],
     ].map(([z, label]) => h('button', { type: 'button', 'aria-pressed': String(A.zoom === z), onclick: () => ((A.zoom = z), paintBuilder()) }, label)),
   );
+  // (append and replaceChildren print a null as the word "null", so nulls are filtered out first)
   controls.replaceChildren(
-    h('div', { class: 'card stack' }, h('strong', { text: 'Who fills the next field' }), rolePick, h('strong', { text: 'Field types' }), palette, h('div', { class: 'row' }, h('button', { class: 'btn small', type: 'button', onclick: fillEveryBlank }, 'Put a field on every blank'), zoom)),
-    A.armed ? h('p', { class: 'big-note', role: 'status' }, `Now tap the page where the ${FIELD_TYPES[A.armed].label} field goes.`, ' ', h('button', { class: 'btn small', type: 'button', onclick: () => ((A.armed = null), paintBuilder()) }, 'Cancel')) : null,
+    ...[
+      h('div', { class: 'card stack' }, h('strong', { text: 'Who fills the next field' }), rolePick, h('strong', { text: 'Field types' }), palette, h('div', { class: 'row' }, h('button', { class: 'btn small', type: 'button', onclick: fillEveryBlank }, 'Put a field on every blank'), zoom)),
+      A.armed ? h('p', { class: 'big-note', role: 'status' }, `Now tap the page where the ${FIELD_TYPES[A.armed].label} field goes.`, ' ', h('button', { class: 'btn small', type: 'button', onclick: () => ((A.armed = null), paintBuilder()) }, 'Cancel')) : null,
+    ].filter(Boolean),
   );
   renderPages(pagesEl, A.layout, A.draft.fields, {
     roles: rs,
-    values: senderValueMap(),
+    values: boxValueMap(),
+    // An empty box says so. What a box shows is what prints.
+    emptyText: (f) => (f.role === SENDER_ROLE ? `Fill in: ${f.label || FIELD_TYPES[f.type].label}` : f.label || FIELD_TYPES[f.type].label),
     selected: A.selected,
     showEmpty: true,
     showNumbers: true,
@@ -738,13 +787,13 @@ function fieldPointerDown(e, f, el) {
   el.addEventListener('pointercancel', up);
 }
 
-function senderValueEditor(f, onChange) {
-  const v = f.value;
+// The value editor for a box: what you fill in now (id "fv"), or what a signer's box starts with (id "f-pre").
+function valueEditor(f, v, onChange, { id = 'fv', title = 'What prints on the document', tick = 'Ticked' } = {}) {
   if (f.type === 'checkbox') {
-    const c = h('input', { type: 'checkbox', id: 'fv' });
+    const c = h('input', { type: 'checkbox', id });
     c.checked = v === true;
     c.addEventListener('change', () => onChange(c.checked ? true : undefined));
-    return h('label', { class: 'consent', for: 'fv' }, c, h('span', { text: 'Ticked' }));
+    return h('label', { class: 'consent', for: id }, c, h('span', { text: tick }));
   }
   if (f.type === 'address') {
     const a = v && typeof v === 'object' ? { ...v } : { street: '', city: '', state: '', zip: '' };
@@ -752,16 +801,16 @@ function senderValueEditor(f, onChange) {
       const i = h('input', { value: a[key] || '', ...attrs });
       i.addEventListener('input', () => {
         a[key] = i.value;
-        onChange({ ...a });
+        onChange(Object.values(a).some((x) => String(x || '').trim()) ? { ...a } : undefined);
       });
       return h('label', {}, label, i);
     };
-    return h('div', {}, part('street', 'Street'), part('city', 'City'), part('state', 'State', { maxlength: '2' }), part('zip', 'ZIP', { inputmode: 'numeric' }));
+    return h('div', {}, h('strong', { text: title }), part('street', 'Street', { id }), part('city', 'City'), part('state', 'State', { maxlength: '2' }), part('zip', 'ZIP', { inputmode: 'numeric' }));
   }
   const type = { date: 'date', email: 'email', phone: 'tel' }[f.type] || 'text';
-  const i = h('input', { type, id: 'fv', value: typeof v === 'string' ? v : '' });
+  const i = h('input', { type, id, value: typeof v === 'string' ? v : '' });
   i.addEventListener('input', () => onChange(i.value === '' ? undefined : i.value));
-  return h('div', {}, h('label', { for: 'fv' }, 'Value that prints on the document'), i);
+  return h('div', {}, h('label', { for: id }, title), i);
 }
 
 function openFieldPanel(f) {
@@ -811,33 +860,42 @@ function openFieldPanel(f) {
       f.required = req.checked;
       scheduleSave();
     });
-    const parts = [
-      h('label', { for: 'f-label' }, f.role === SENDER_ROLE ? 'Note to yourself' : 'What the signer is asked'),
-      label,
-      h('label', { for: 'f-role' }, 'Who fills it'),
-      roleSel,
-      h('label', { for: 'f-type' }, 'Type'),
-      typeSel,
-    ];
-    if (f.role !== SENDER_ROLE) parts.push(h('label', { class: 'consent', for: 'f-req', style: { borderColor: 'var(--line)', background: '#fff' } }, req, h('span', { text: f.type === 'signature' ? 'Required (always, for signatures)' : 'Required' })));
+    const parts = [];
     if (f.role === SENDER_ROLE) {
+      // Your term: the value comes first, because it is exactly what prints.
       parts.push(
-        h('p', { class: 'hint', text: 'You fill this in now. It prints on the document and the signer cannot change it.' }),
-        senderValueEditor(f, (v) => {
+        valueEditor(f, f.value, (v) => {
           if (v === undefined) delete f.value;
           else f.value = v;
           scheduleSave();
           paintBuilder();
         }),
+        h('p', { class: 'hint', text: 'You fill this in now. It prints on the document exactly like this, and the signer cannot change it.' }),
       );
-    } else if (['full_name', 'company', 'email', 'phone', 'free_text'].includes(f.type)) {
-      const pre = h('input', { id: 'f-pre', value: typeof f.prefill === 'string' ? f.prefill : '' });
-      pre.addEventListener('input', () => {
-        if (pre.value) f.prefill = pre.value;
-        else delete f.prefill;
-        scheduleSave();
-      });
-      parts.push(h('label', { for: 'f-pre' }, 'Pre-fill (optional, the signer can change it)'), pre);
+    }
+    parts.push(
+      h('label', { for: 'f-label' }, f.role === SENDER_ROLE ? 'Name of this box (only you see it)' : 'What the signer is asked'),
+      label,
+      h('label', { for: 'f-role' }, 'Who fills it'),
+      roleSel,
+      h('label', { for: 'f-type' }, 'Type'),
+      typeSel,
+    );
+    if (f.role !== SENDER_ROLE) parts.push(h('label', { class: 'consent', for: 'f-req', style: { borderColor: 'var(--line)', background: '#fff' } }, req, h('span', { text: f.type === 'signature' ? 'Required (always, for signatures)' : 'Required' })));
+    if (f.role !== SENDER_ROLE && ['full_name', 'company', 'email', 'phone', 'free_text', 'address', 'checkbox'].includes(f.type)) {
+      parts.push(
+        valueEditor(
+          f,
+          f.prefill,
+          (v) => {
+            if (v === undefined) delete f.prefill;
+            else f.prefill = v;
+            scheduleSave();
+            paintBuilder();
+          },
+          { id: 'f-pre', title: 'Already in the box when they open it (optional, they can change it)', tick: 'Start ticked (they can untick it)' },
+        ),
+      );
     }
     if (f.type === 'date' && f.role !== SENDER_ROLE) {
       const allow = h('input', { type: 'checkbox', id: 'f-allow' });
@@ -887,6 +945,7 @@ function openFieldPanel(f) {
     closeSheet();
     await changed();
   };
+  if (f.role === SENDER_ROLE) setTimeout(() => body.querySelector('#fv')?.focus?.(), 30);
   openSheet(
     `Field ${f.n}: ${FIELD_TYPES[f.type].label}`,
     body,
@@ -932,6 +991,7 @@ function renderSigners(body) {
         const card = h(
           'div',
           { class: 'card' },
+          isOwnerSigner(s, A.owner.email) ? h('span', { class: 'chip-status signed', text: 'You. You sign last.' }) : null,
           h('label', { for: `r${i}` }, 'Role (for example Client)'),
           role,
           ...field('name', 'Full name', { autocomplete: 'off' }),
@@ -957,21 +1017,38 @@ function renderSigners(body) {
   };
   paint();
   body.append(
-    h('p', { class: 'hint', text: 'Each signer gets a private link. You sign through your own link too.' }),
-    list,
-    A.draft.signers.length < 10
-      ? h('button', { class: 'btn', type: 'button', onclick: () => {
-          let k = A.draft.signers.length + 1;
-          while (A.draft.signers.some((s) => s.role === `Signer ${k}`)) k += 1;
-          A.draft.signers.push({ role: `Signer ${k}`, name: '', email: '', phone: '' });
-          scheduleSave();
-          paint();
-        } }, 'Add signer')
-      : null,
+    ...[
+      h('p', { class: 'hint', text: orderSentence(A.draft.signers) }),
+      list,
+      A.draft.signers.length < 10
+        ? h('button', { class: 'btn', type: 'button', onclick: () => {
+            let k = A.draft.signers.length + 1;
+            while (A.draft.signers.some((s) => s.role === `Signer ${k}`)) k += 1;
+            A.draft.signers.push({ role: `Signer ${k}`, name: '', email: '', phone: '' });
+            scheduleSave();
+            paint();
+          } }, 'Add signer')
+        : null,
+    ].filter(Boolean),
   );
 }
 
-// ---------- Send tab ----------
+// "Jay Smith (Client) signs first, then you. Then you both get the signed PDF by email."
+function orderSentence(signers) {
+  const order = signingOrder(signers, A.owner.email);
+  const names = order.map((s) => (isOwnerSigner(s, A.owner.email) ? 'you' : `${s.name || s.role} (${s.role})`));
+  const youSign = order.some((s) => isOwnerSigner(s, A.owner.email));
+  const lead = !order.length
+    ? 'Add a signer.'
+    : order.length === 1
+      ? names[0] === 'you'
+        ? 'You sign.'
+        : `${names[0]} signs.`
+      : `${names[0]} signs first, then ${joinNames(names.slice(1))}.`;
+  return `${lead} Each one gets a private link when it is their turn. Then ${youSign && order.length === 2 ? 'you both get' : 'everyone gets'} the signed PDF${A.mailReady ? ' by email' : ''}.`;
+}
+
+// ---------- Finish tab ----------
 
 function previewRecord() {
   return {
@@ -1014,13 +1091,33 @@ function shareRow(link, title) {
   );
 }
 
+// Opens a field's panel from a "Fill in field N" problem.
+async function showField(n) {
+  await saveNow();
+  const hash = `#/doc/${A.doc.id}/fields`;
+  if (location.hash !== hash) history.pushState(null, '', hash);
+  A.tab = 'fields';
+  A.armed = null;
+  A.selected = n;
+  await relayout();
+  renderDoc();
+  const f = A.draft.fields.find((x) => x.n === n);
+  if (!f) return;
+  document.querySelector(`.fbox[data-n="${n}"]`)?.scrollIntoView?.({ block: 'center' });
+  openFieldPanel(f);
+}
+
 function renderSend(body) {
   const problems = sendProblems({ ...A.draft }, A.layout.pages.length);
+  const order = signingOrder(A.draft.signers, A.owner.email);
+  const first = order[0];
+  const firstLabel = first ? firstName(first.name) || first.role : 'the first signer';
   const days = h('select', { id: 'days' }, ...[7, 14, 30].map((d) => h('option', { value: d, selected: d === 14 }, `${d} days`)));
-  const btn = h('button', { class: 'btn primary', type: 'button', disabled: problems.length > 0 }, 'Lock it and make signing links');
+  const btn = h('button', { class: 'btn primary wide', type: 'button', disabled: problems.length > 0 }, A.mailReady ? `Send to ${firstLabel} by email` : `Lock it and make ${firstLabel}'s link`);
   const err = h('p', { class: 'error', role: 'alert' });
   btn.addEventListener('click', async () => {
     btn.disabled = true;
+    btn.textContent = 'Sending...';
     err.textContent = '';
     await saveNow();
     try {
@@ -1030,18 +1127,45 @@ function renderSend(body) {
     } catch (e) {
       if (!fail(e)) err.textContent = e.body?.problems?.join(' ') || e.message;
       btn.disabled = false;
+      btn.textContent = A.mailReady ? `Send to ${firstLabel} by email` : `Lock it and make ${firstLabel}'s link`;
     }
   });
+  const steps = order.map((s) =>
+    h('li', { text: isOwnerSigner(s, A.owner.email) ? 'You sign last. Your link comes by email when it is your turn, or tap Sign now here.' : `${s.name || s.role} (${s.role}) fills in their boxes and signs${s.email ? `. Link goes to ${s.email}` : ''}.` }),
+  );
+  steps.push(h('li', { text: `${order.length === 2 && order.some((s) => isOwnerSigner(s, A.owner.email)) ? 'You both get' : 'Everyone gets'} the signed PDF${A.mailReady ? ' by email' : ''}. It lands in Finished.` }));
   body.append(
     problems.length
-      ? h('div', { class: 'card' }, h('h2', { text: 'Before you can send' }), h('ul', { class: 'problems' }, ...problems.map((p) => h('li', { text: p }))))
-      : h('div', { class: 'card' }, h('h2', { text: 'Ready to send' }), h('p', { text: 'Every term is filled in and every signer has a signature field.' })),
+      ? h(
+          'div',
+          { class: 'card' },
+          h('h2', { text: 'Almost done. Fix these first:' }),
+          h(
+            'ul',
+            { class: 'problems' },
+            ...problems.map((p) => {
+              const n = /^(?:Fill in field|Field) (\d+)/.exec(p)?.[1];
+              const aboutSigners = /signer|email for|name for|role/i.test(p);
+              const jump = n
+                ? h('button', { class: 'btn small', type: 'button', style: { marginLeft: '8px' }, onclick: () => showField(Number(n)) }, 'Show me')
+                : aboutSigners
+                  ? h('button', { class: 'btn small', type: 'button', style: { marginLeft: '8px' }, onclick: () => go(`#/doc/${A.doc.id}/signers`) }, 'Go to Signers')
+                  : null;
+              return h('li', {}, p, jump);
+            }),
+          ),
+        )
+      : h('div', { class: 'card' }, h('h2', { text: 'Every box is good to go' }), h('p', { text: 'Every term is filled in and every signer has a signature box.' })),
+    h('div', { class: 'card' }, h('h2', { text: 'What happens next' }), h('ol', { class: 'steps' }, ...steps)),
     h('div', { class: 'card' }, h('h2', { text: 'Check how it prints' }), h('button', { class: 'btn', type: 'button', onclick: () => savePdf(previewRecord(), 'preview', { audit: false }).catch((e) => toast(e.message)) }, 'Download a preview PDF')),
     h(
       'div',
       { class: 'card' },
-      h('h2', { text: 'Send' }),
-      h('p', { text: 'Sending locks the wording, the fields and the signers. Each signer gets a private link. You share the links yourself by text, email or copy.' }),
+      h('h2', { text: 'Send it' }),
+      h(
+        'p',
+        { text: A.mailReady ? `Sending locks the wording, the boxes and the signers, then emails ${firstLabel} from your email (${A.owner.email}).` : 'Sending locks the wording, the boxes and the signers. Email is not set up yet, so you share the link yourself (copy, text or your own email app).' },
+      ),
       h('label', { for: 'days' }, 'Links stop working after'),
       days,
       h('div', { style: { marginTop: '14px' } }, btn),
@@ -1052,49 +1176,169 @@ function renderSend(body) {
 
 // ---------- Status view (after sending) ----------
 
+const newest = (rows) => rows.reduce((a, b) => (!a || String(b.created_at) >= String(a.created_at) ? b : a), null);
+
+// append() prints a null child as the word "null"; this skips them.
+const add = (el, ...kids) => el.append(...kids.filter((k) => k !== null && k !== undefined && k !== false));
+
+// What happened to the newest signing-link email to one signer, in plain words.
+function inviteNote(signerId) {
+  const row = newest(A.outbox.filter((o) => o.kind === 'invite' && o.signer_id === signerId && !o.cancelled_at));
+  if (!row) return null;
+  if (row.sent_at) return { ok: true, text: `Link emailed to ${row.to} ${when(row.sent_at)}.` };
+  if (row.last_error) return { ok: false, text: `The email to ${row.to} has not gone out (${row.last_error}). It tries again every 10 minutes, or tap Email it again.` };
+  return { ok: true, text: `Emailing ${row.to}...` };
+}
+
+async function reloadDoc() {
+  loadDocResponse(await api('GET', `/api/documents/${A.doc.id}`));
+  renderDoc();
+}
+
+// Your turn: a fresh link for you, opened right here.
+async function signNow(s) {
+  try {
+    const r = await api('POST', `/api/documents/${A.doc.id}/signers/${s.id}/link`, { body: { expires_days: A.doc.link_days || 14 } });
+    location.href = r.link.url;
+  } catch (e) {
+    fail(e);
+  }
+}
+
+async function emailAgain(s) {
+  try {
+    const r = await api('POST', `/api/documents/${A.doc.id}/signers/${s.id}/email`, { body: {} });
+    const res = r.emailed.find((e) => !e.skipped);
+    toast(res?.ok ? `Emailed ${firstName(s.name) || s.role} a fresh link.` : `That did not go out: ${res?.error || res?.cancelled || 'try again'}.`);
+    await reloadDoc();
+  } catch (e) {
+    fail(e);
+  }
+}
+
+async function shareLink(s) {
+  try {
+    const r = await api('POST', `/api/documents/${A.doc.id}/signers/${s.id}/link`, { body: { expires_days: A.doc.link_days || 14 } });
+    A.links = [r.link];
+    await reloadDoc();
+  } catch (e) {
+    fail(e);
+  }
+}
+
+// Builds the finished PDF on this device and emails it to everyone, attached.
+async function emailCopies(out, again) {
+  out.replaceChildren(h('p', { class: 'hint', text: 'Building the PDF and emailing it...' }));
+  try {
+    const { record } = await api('GET', `/api/documents/${A.doc.id}/record`);
+    const { pdf_b64 } = await pdfForEmail(record);
+    const r = await api('POST', `/api/documents/${A.doc.id}/copy`, { body: { pdf_b64, again } });
+    const ok = r.emailed.filter((e) => e.ok).map((e) => e.to);
+    toast(ok.length ? `Emailed the signed PDF to ${joinNames(ok)}.` : r.mail ? 'Nothing was waiting to go out.' : 'Email is not set up yet.');
+    await reloadDoc();
+  } catch (e) {
+    if (!fail(e)) out.replaceChildren(h('p', { class: 'error', text: e.message }));
+  }
+}
+
+async function downloadSigned(out) {
+  out.replaceChildren(h('p', { class: 'hint', text: 'Building the PDF...' }));
+  try {
+    const { record } = await api('GET', `/api/documents/${A.doc.id}/record`);
+    const { hash, url } = await savePdf(record);
+    out.replaceChildren(
+      h('p', {}, h('a', { href: url, target: '_blank', rel: 'noopener' }, 'Open the PDF to print it'), ' if the download did not start.'),
+      h('p', { class: 'hint', text: "File fingerprint (SHA-256). The client's copy shows the same one:" }),
+      h('p', { class: 'mono', text: hash }),
+    );
+  } catch (e) {
+    fail(e);
+  }
+}
+
+// Who got the signed copy, from the audit trail and the emails still waiting.
+function copyLines() {
+  const sent = A.events.filter((e) => e.type === 'email_sent' && e.details?.kind === 'copy');
+  const waiting = A.outbox.filter((o) => o.kind === 'copy' && !o.sent_at && !o.cancelled_at);
+  return [
+    ...sent.map((e) => h('li', { text: `${e.details.to}: emailed ${when(e.at)}, ${e.details.attached ? 'PDF attached' : 'with a download link'}` })),
+    ...waiting.map((o) => h('li', { class: o.last_error ? 'error' : null, text: `${o.to}: ${o.last_error ? `not sent yet (${o.last_error}), trying again` : 'waiting for the PDF, goes out within a few minutes'}` })),
+  ];
+}
+
 function renderStatus(body) {
   const d = A.doc;
   const out = h('div');
-  const open = ['sent', 'viewed'].includes(d.status);
-  const signerCards = d.signers.map((s) =>
-    h(
-      'div',
-      { class: 'card' },
-      h('div', { class: 'row', style: { justifyContent: 'space-between' } }, h('strong', { text: `${s.name} (${s.role})` }), statusChip(s.status)),
-      h('p', { class: 'hint', text: s.email }),
-      s.viewed_at ? h('p', { class: 'hint', text: `Opened ${when(s.viewed_at)}` }) : null,
-      s.signed_at ? h('p', { class: 'hint', text: `Signed ${when(s.signed_at)}` }) : null,
-      s.status === 'declined' ? h('p', { class: 'error', text: `Declined: ${s.decline_reason}` }) : null,
-      open && !['signed', 'declined'].includes(s.status)
-        ? h('button', { class: 'btn small', type: 'button', onclick: async () => {
-            try {
-              const r = await api('POST', `/api/documents/${d.id}/signers/${s.id}/link`, { body: { expires_days: 14 } });
-              A.links = [r.link];
-              renderDoc();
-            } catch (e) {
-              fail(e);
-            }
-          } }, 'Make a new link')
-        : null,
+  const own = (s) => isOwnerSigner(s, A.owner.email);
+  const order = signingOrder(d.signers, A.owner.email);
+  const you = order.find(own) || null;
+  const waitingOn = d.signers.find((s) => s.turn) || order.find((s) => s.status !== 'signed') || null;
+  const both = order.length === 2 && you ? 'you both get' : 'everyone gets';
+  const banner = h('div', { class: `card banner ${d.stage || ''}` });
+  if (d.stage === 'your_turn') {
+    const before = order.filter((s) => s.status === 'signed' && !own(s)).map((s) => s.name);
+    banner.append(
+      h('h2', { text: before.length ? `${joinNames(before)} signed. Your turn.` : 'Your turn to sign.' }),
+      h('p', { text: `Sign and date it to finish. Then ${both} the signed PDF${A.mailReady ? ' by email' : ''}, and it moves to Finished.` }),
+      h('button', { class: 'btn gold wide', type: 'button', onclick: () => signNow(you || waitingOn) }, 'Sign now'),
+    );
+    const note = you ? inviteNote(you.id) : null;
+    if (note) banner.append(h('p', { class: note.ok ? 'hint' : 'error', text: note.text }));
+  } else if (d.stage === 'waiting' || d.display_status === 'expired') {
+    const who = waitingOn;
+    banner.append(h('h2', { text: d.display_status === 'expired' ? `${who ? `${who.name}'s` : 'The'} link ran out` : `Waiting on ${who ? who.name : 'the signers'}` }));
+    const note = who ? inviteNote(who.id) : null;
+    if (note) banner.append(h('p', { class: note.ok ? 'hint' : 'error', text: note.text }));
+    else if (!A.mailReady) banner.append(h('p', { class: 'hint', text: 'Email is not set up yet, so share the link yourself.' }));
+    if (you && who && !own(who)) banner.append(h('p', { class: 'hint', text: `When ${firstName(who.name) || who.role} finishes, it comes back to you${A.mailReady ? ' by email' : ''} to sign.` }));
+    if (who) {
+      banner.append(
+        h(
+          'div',
+          { class: 'row' },
+          A.mailReady ? h('button', { class: 'btn small', type: 'button', onclick: () => emailAgain(who) }, 'Email it again') : null,
+          h('button', { class: 'btn small', type: 'button', onclick: () => shareLink(who) }, 'Share a link yourself'),
+        ),
+      );
+    }
+  } else if (d.stage === 'finished') {
+    const lines = copyLines();
+    add(
+      banner,
+      h('h2', { text: `Finished. Signed by ${order.length === 2 ? 'both parties' : 'everyone'}.` }),
+      h('p', { text: `${joinNames(order.map((s) => s.name))} signed. Completed ${when(d.completed_at)}.` }),
+      h('button', { class: 'btn gold wide', type: 'button', onclick: () => downloadSigned(out) }, 'Download or print the PDF'),
+      h('h3', { text: 'Signed copies' }),
+      lines.length ? h('ul', { class: 'copies' }, ...lines) : h('p', { class: 'hint', text: A.mailReady ? 'Not emailed yet.' : 'Email is not set up yet. Download the PDF and send it yourself.' }),
+      A.mailReady ? h('button', { class: 'btn small', type: 'button', onclick: () => emailCopies(out, true) }, lines.length ? 'Email the signed PDF to everyone again' : 'Email the signed PDF to everyone') : null,
+      out,
+    );
+  } else if (d.status === 'declined') {
+    const s = d.signers.find((x) => x.status === 'declined');
+    add(banner, h('h2', { text: `${s ? s.name : 'A signer'} declined` }), s?.decline_reason ? h('p', { text: `Reason: ${s.decline_reason}` }) : null);
+  } else if (d.status === 'void') {
+    banner.append(h('h2', { text: 'You voided this document' }));
+  }
+  const steps = h(
+    'ol',
+    { class: 'steps' },
+    ...order.map((s) =>
+      h(
+        'li',
+        {},
+        h('strong', { text: own(s) ? `You (${s.role})` : `${s.name} (${s.role})` }),
+        ' ',
+        statusChip(s.status === 'pending' ? 'waiting' : s.status),
+        h('span', {
+          class: 'hint',
+          style: { display: 'block' },
+          text: [s.email, s.viewed_at ? `opened ${when(s.viewed_at)}` : '', s.signed_at ? `signed ${when(s.signed_at)}` : '', s.status === 'declined' ? `declined: ${s.decline_reason}` : ''].filter(Boolean).join('  |  '),
+        }),
+      ),
     ),
   );
   const actions = h('div', { class: 'row' });
-  if (d.status === 'signed') {
-    actions.append(
-      h('button', { class: 'btn gold', type: 'button', onclick: async () => {
-        out.replaceChildren(h('p', { class: 'hint', text: 'Building the PDF...' }));
-        try {
-          const { record } = await api('GET', `/api/documents/${d.id}/record`);
-          const { hash, url } = await savePdf(record);
-          out.replaceChildren(h('p', {}, h('a', { href: url, target: '_blank', rel: 'noopener' }, 'Open the PDF'), ' if the download did not start.'), h('p', { class: 'hint', text: 'File fingerprint (SHA-256). The signer\'s copy shows the same one:' }), h('p', { class: 'mono', text: hash }));
-        } catch (e) {
-          fail(e);
-        }
-      } }, 'Download signed PDF'),
-    );
-  } else {
-    actions.append(h('button', { class: 'btn', type: 'button', onclick: () => savePdf(previewRecord(), 'preview', { audit: false }).catch((e) => toast(e.message)) }, 'Preview PDF'));
-  }
+  if (d.status !== 'signed') actions.append(h('button', { class: 'btn', type: 'button', onclick: () => savePdf(previewRecord(), 'preview', { audit: false }).catch((e) => toast(e.message)) }, 'Preview PDF'));
   if (!['signed', 'void'].includes(d.status)) {
     const voidBtn = h('button', { class: 'btn danger', type: 'button' }, 'Void');
     let armed = false;
@@ -1139,13 +1383,14 @@ function renderStatus(body) {
     { class: 'timeline' },
     ...[...A.events].reverse().map((e) => h('li', {}, h('span', { class: 'when', text: `${when(e.at)}${e.ip ? `  |  IP ${e.ip}` : ''}${e.device ? `  |  ${e.device}` : ''}` }), describeEvent(e, { signers: d.signers }))),
   );
-  body.append(
-    A.links.length ? h('div', {}, h('h2', { text: 'Signing links' }), h('p', { class: 'hint', text: 'These show once. If one gets lost, make a new link below; the old one stops working.' }), ...A.links.map((l) => shareRow(l, d.title))) : null,
+  add(
+    body,
+    banner,
+    A.links.length ? h('div', {}, h('h2', { text: 'Link to share yourself' }), h('p', { class: 'hint', text: 'This shows once. If it gets lost, make a new one; the old one stops working.' }), ...A.links.map((l) => shareRow(l, d.title))) : null,
     d.sent_at ? h('p', { class: 'hint', text: `Sent ${when(d.sent_at)}. Document fingerprint ${String(d.doc_sha256 || '').slice(0, 16)}...` }) : null,
-    h('h2', { text: 'Signers' }),
-    ...signerCards,
+    h('h2', { text: 'Who signs, in order' }),
+    steps,
     actions,
-    out,
     h('h2', { text: 'Audit trail' }),
     timeline,
   );

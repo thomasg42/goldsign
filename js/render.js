@@ -86,7 +86,7 @@ function boxContent(f, value) {
 
 // Renders every page. options:
 //   roles: role names in order, values: { n: value }, selected: n,
-//   isMine(f): field is editable here, showEmpty: show prompts on empty boxes,
+//   isMine(f): field is editable here, showEmpty: show prompts on empty boxes, emptyText(f): that prompt,
 //   onFieldPointerDown(e, f, el), onPagePointerDown(e, pageIndex, pageEl), zoom (1 = fit width)
 export function renderPages(container, layout, fields, options = {}) {
   const roles = options.roles || [];
@@ -112,7 +112,7 @@ export function renderPages(container, layout, fields, options = {}) {
     const el = h(
       'div',
       {
-        class: `fbox${content ? ' filled' : ''}${!mine ? ' readonly' : ''}${options.selected === f.n ? ' selected' : ''}`,
+        class: `fbox${content ? ' filled' : ' empty'}${!mine ? ' readonly' : ''}${options.selected === f.n ? ' selected' : ''}${f.role === SENDER_ROLE ? ' term' : ''}`,
         'data-n': f.n,
         role: mine ? 'button' : null,
         tabindex: mine ? '0' : null,
@@ -125,7 +125,7 @@ export function renderPages(container, layout, fields, options = {}) {
         },
       },
       options.showNumbers ? h('span', { class: 'num', text: f.n }) : null,
-      content || (options.showEmpty && mine ? h('span', { class: 'label', text: f.label || FIELD_TYPES[f.type].label }) : null),
+      content || (options.showEmpty && mine ? h('span', { class: 'label', text: options.emptyText ? options.emptyText(f) : f.label || FIELD_TYPES[f.type].label }) : null),
     );
     el.style.setProperty('--role', roleColor(f.role, roles));
     if (options.selected === f.n && !r.anchored && options.resizable) el.append(h('span', { class: 'handle', 'data-handle': '1' }));
@@ -136,6 +136,7 @@ export function renderPages(container, layout, fields, options = {}) {
 }
 
 // Phone reading view: real text at a readable size, fields as tappable chips in place.
+// options.mineEl(f), when given, draws the signer's own fields (inline inputs on the signer page).
 export function renderReader(container, body, fields, layout, options = {}) {
   const roles = options.roles || [];
   const values = options.values || {};
@@ -166,6 +167,12 @@ export function renderReader(container, body, fields, layout, options = {}) {
     const value = values[f.n];
     const fixed = f.role === SENDER_ROLE;
     const mine = options.isMine ? options.isMine(f) : false;
+    if (mine && options.mineEl) {
+      // The signer types straight into their own boxes, outlined in their color.
+      const own = options.mineEl(f);
+      own.style.setProperty('--role', roleColor(f.role, roles));
+      return own;
+    }
     const has = !(value === undefined || value === null || value === '' || (f.type === 'checkbox' && value !== true));
     if (fixed) return h('span', { class: 'fchip fixed', text: displayValue(f, value) || '(left blank)' });
     let inner;

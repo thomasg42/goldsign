@@ -1,11 +1,8 @@
 // Builds the signed PDF in the browser from the sealed record and saves it.
-import { buildPdf } from './shared/pdf.js';
+import { buildPdf, fileName } from './shared/pdf.js';
 import { sha256Hex } from './shared/canon.js';
 
-export function fileName(title, suffix) {
-  const base = String(title || 'document').replace(/[^\w\s-]+/g, '').trim().replace(/\s+/g, '-').slice(0, 60) || 'document';
-  return `${base}-${suffix}.pdf`;
-}
+export { fileName };
 
 export async function pdfBytes(record, options) {
   const PDFLib = await import('../vendor/pdf-lib-1.17.1.esm.min.js');
@@ -24,4 +21,16 @@ export async function savePdf(record, suffix = 'signed', options) {
   a.click();
   a.remove();
   return { hash, url };
+}
+
+export function toBase64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+// The finished PDF, ready to send to the Worker for the "signed copy" emails.
+export async function pdfForEmail(record) {
+  const bytes = await pdfBytes(record);
+  return { pdf_b64: toBase64(bytes), hash: await sha256Hex(bytes) };
 }

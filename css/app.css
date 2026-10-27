@@ -891,3 +891,168 @@ h2 {
   font-weight: 600;
   max-width: calc(100vw - 32px);
 }
+
+/* ---------- finish, send in order, piles ---------- */
+
+.btn.wide {
+  width: 100%;
+}
+
+.finish-bar {
+  margin: 28px 0 8px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.pile {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 24px;
+}
+
+.pile .count {
+  font-size: 13px;
+  font-weight: 700;
+  background: #e9ecf1;
+  border-radius: 999px;
+  padding: 1px 9px;
+}
+
+.steps {
+  margin: 0;
+  padding-left: 22px;
+}
+
+.steps li {
+  margin: 0 0 10px;
+}
+
+.banner {
+  border-width: 2px;
+}
+
+.banner.your_turn {
+  border-color: var(--gold);
+  background: #fffaf0;
+}
+
+.banner.waiting {
+  border-color: #bcd0f7;
+}
+
+.banner.finished {
+  border-color: #a7dcbc;
+  background: #f3fbf6;
+}
+
+.banner h2 {
+  margin-top: 0;
+}
+
+.banner h3 {
+  font-size: 16px;
+  margin: 18px 0 6px;
+}
+
+.copies {
+  margin: 0 0 10px;
+  padding-left: 18px;
+  font-size: 15px;
+}
+
+/* A gold box is a term you fill in now. Empty ones say so; filled ones show exactly what prints. */
+.fbox.term.empty {
+  border-width: 2px;
+  background: color-mix(in srgb, var(--role, #b07d12) 26%, #fff);
+}
+
+.fbox.term.empty .label {
+  font-style: italic;
+  color: #6b4a00;
+  opacity: 1;
+}
+
+.fbox.term.filled .label {
+  font-weight: 700;
+  color: #10204a;
+  opacity: 1;
+}
+
+/* ---------- signer: typing straight into the boxes ---------- */
+
+.fchip.fin {
+  flex-wrap: wrap;
+  gap: 2px 6px;
+  padding: 2px 6px;
+  cursor: text;
+  background: #fffdf3;
+}
+
+.fchip.fin.done {
+  background: #fff;
+}
+
+.fchip.fin input,
+.fchip.fin textarea {
+  border: 0;
+  background: transparent;
+  min-height: 36px;
+  padding: 2px 4px;
+  font-weight: 600;
+  color: #10204a;
+  max-width: 100%;
+}
+
+.fchip.fin input:focus,
+.fchip.fin textarea:focus {
+  outline: none;
+}
+
+.fchip.fin:focus-within {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.fchip.fin.multi {
+  display: flex;
+  width: 100%;
+}
+
+.fchip.fin.multi textarea {
+  width: 100%;
+  min-height: 90px;
+}
+
+.fchip.bad {
+  border-color: var(--danger);
+  background: #fff5f4;
+}
+
+.fchip .ferr {
+  flex-basis: 100%;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--danger);
+}
+
+.fchip .ferr:empty {
+  display: none;
+}
+
+.fchip.tick {
+  cursor: pointer;
+}
+
+.fchip.tick span {
+  font-size: 14px;
+}
+
+.sticky-bar .btn.finish {
+  background: var(--gold);
+  border-color: var(--gold);
+  color: var(--ink);
+  max-width: 64vw;
+  white-space: normal;
+  line-height: 1.2;
+}

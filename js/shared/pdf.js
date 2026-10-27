@@ -7,6 +7,14 @@ import { displayValue, formatUtc, isImageType, CONSENT_TEXT, CONSENT_VERSION } f
 const GRAY = [0.45, 0.45, 0.45];
 const LINE = [0.55, 0.55, 0.55];
 
+// The same file name for a download and an emailed copy.
+export function fileName(title, suffix) {
+  const base = String(title || 'document').replace(/[^\w\s-]+/g, '').trim().replace(/\s+/g, '-').slice(0, 60) || 'document';
+  return `${base}-${suffix}.pdf`;
+}
+
+const EMAIL_KINDS = { invite: 'Signing link', copy: 'Signed copy' };
+
 export function describeEvent(e, record) {
   const s = (record.signers || []).find((x) => x.id === e.signer_id);
   const who = s ? `${s.name} (${s.role})` : 'Sender';
@@ -34,6 +42,12 @@ export function describeEvent(e, record) {
       return 'Every signer finished. The record was sealed';
     case 'voided':
       return `Sender voided the document${d.reason ? `. Reason: ${d.reason}` : ''}`;
+    case 'email_sent':
+      return `${EMAIL_KINDS[d.kind] || 'Email'} emailed to ${d.to}${d.attached ? ' with the signed PDF attached' : ''}`;
+    case 'email_failed':
+      return `${EMAIL_KINDS[d.kind] || 'Email'} to ${d.to} did not go out (${d.error || 'no reason given'})`;
+    case 'copy_built':
+      return `Signed PDF made for emailing, file fingerprint ${String(d.file_sha256 || '').slice(0, 16)}...`;
     default:
       return `${e.type}${s ? ` by ${who}` : ''}`;
   }
