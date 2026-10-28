@@ -1,16 +1,19 @@
 // Signer page. No account: the link's code (after #t=) is the key. Built for a phone first.
 // The signer taps straight into their boxes on the document and types, then taps Finish at the bottom.
 // #c=<code> opens the download page for a finished document instead (the link in the signed-copy email).
+// "Read it out loud to me" reads the document aloud and fills the boxes by voice (read-aloud.js, voice.js).
 
 import { ApiError, api, timezone } from './api.js';
 import { CONFIG } from './config.js';
 import { h, layoutFor, renderPages, renderReader } from './render.js';
-import { FIELD_TYPES, displayValue, formatDate, isImageType, validateValue } from './shared/fields.js';
+import { FIELD_TYPES, SENDER_ROLE, displayValue, formatDate, isImageType, validateValue } from './shared/fields.js';
 import { readingOrder } from './shared/layout.js';
 import { sha256Hex } from './shared/canon.js';
 import { firstName, joinNames } from './shared/order.js';
 import { SCRIPT_FONTS, drawPad, typedPng } from './sigpad.js';
 import { pdfForEmail, savePdf } from './download.js';
+import { blobToBase64, createVoice, toWav16k } from './voice.js';
+import { buildScript, createReadAloud } from './read-aloud.js';
 
 const root = document.getElementById('app');
 const params = new URLSearchParams(location.hash.slice(1));
@@ -26,7 +29,11 @@ const S = {
   view: 'text',
   started: false,
   draftKey: null,
+  reader: null, // the read-aloud run, while one is going
+  voicePos: 0, // where reading stopped, so "Keep going" picks up there
 };
+
+const VOICE = createVoice(); // the page's own speaker and microphone (globalThis is window in a browser)
 
 function topbar() {
   return h('header', { class: 'topbar' }, h('div', { class: 'brand' }, CONFIG.APP_NAME.replace(/Sign$/, ''), h('span', { text: /Sign$/.test(CONFIG.APP_NAME) ? 'Sign' : '' })), h('div', { class: 'spacer' }));
@@ -156,14 +163,22 @@ function showMain({ keepScroll = false } = {}) {
         h('div', { class: 'row' }, h('button', { class: 'btn primary', type: 'button', onclick: () => focusNext() }, 'Start')),
       )
     : null;
+  const voiceStart = VOICE.supported
+    ? h(
+        'div',
+        { class: 'voice-start' },
+        h('button', { class: 'btn gold', type: 'button', onclick: openReadAloud }, 'Read it out loud to me'),
+        h('p', { class: 'hint', text: S.session.voice ? 'It reads the whole document to you and stops at each of your boxes so you can say your answer.' : 'It reads the whole document to you and stops at each of your boxes so you can type your answer.' }),
+      )
+    : null;
   const viewSwitch = h(
     'div',
     { class: 'row' },
     h(
       'div',
       { class: 'seg', role: 'group', 'aria-label': 'How to show the document' },
-      h('button', { type: 'button', 'aria-pressed': String(S.view === 'text'), onclick: () => ((S.view = 'text'), showMain()) }, 'Easy reading'),
-      h('button', { type: 'button', 'aria-pressed': String(S.view === 'pages'), onclick: () => ((S.view = 'pages'), showMain()) }, 'Page view'),
+      h('button', { type: 'button', 'aria-pressed': String(S.view === 'text'), onclick: () => (stopReading(), (S.view = 'text'), showMain()) }, 'Easy reading'),
+      h('button', { type: 'button', 'aria-pressed': String(S.view === 'pages'), onclick: () => (stopReading(), (S.view = 'pages'), showMain()) }, 'Page view'),
     ),
   );
   const docEl = h('div', { class: S.view === 'text' ? 'reader' : 'pages', id: 'doc' });
@@ -171,6 +186,7 @@ function showMain({ keepScroll = false } = {}) {
     h('h1', { text: doc.title }),
     h('p', { class: 'hint' }, `For ${S.session.signer.name} (${S.session.signer.role})`),
     intro,
+    voiceStart,
     viewSwitch,
     docEl,
     h('p', { class: 'center' }, h('button', { class: 'btn link', type: 'button', onclick: openDecline }, 'I do not want to sign this')),
@@ -328,7 +344,7 @@ function closeSheet() {
   sheetCleanup = null;
 }
 
-function openSheet(title, body, actions) {
+function openSheet(title, body, actions, { onClose } = {}) {
   closeSheet();
   const backdrop = h('div', { class: 'sheet-backdrop', onclick: closeSheet });
   const sheet = h('div', { class: 'sheet', role: 'dialog', 'aria-modal': 'true', 'aria-label': title }, h('h2', { text: title }), body, h('div', { class: 'row end', style: { marginTop: '16px' } }, ...actions));
@@ -336,13 +352,16 @@ function openSheet(title, body, actions) {
     if (e.key === 'Escape') closeSheet();
   };
   document.addEventListener('keydown', onKey);
-  sheetCleanup = () => document.removeEventListener('keydown', onKey);
+  sheetCleanup = () => {
+    document.removeEventListener('keydown', onKey);
+    onClose?.();
+  };
   document.body.append(backdrop, sheet);
   setTimeout(() => sheet.querySelector('input:not([type=checkbox]), textarea, button.primary')?.focus(), 30);
   return sheet;
 }
 
-function inputFor(f, current) {
+function inputFor(f, current, { typed = false } = {}) {
   const t = f.type;
   if (t === 'date' && !f.allowChange) {
     return { el: h('p', { class: 'big-note' }, `Filled in for you with today's date: ${formatDate(S.session.today)}.`), read: () => S.session.today };
@@ -371,7 +390,7 @@ function inputFor(f, current) {
     );
     return { el, read: () => ({ street: street.value, city: city.value, state: state.value, zip: zip.value }) };
   }
-  if (isImageType(t)) return signatureInput(f, current);
+  if (isImageType(t)) return signatureInput(f, current, { typed });
   const attrs = {
     full_name: { autocomplete: 'name', autocapitalize: 'words' },
     company: { autocomplete: 'organization' },
@@ -385,8 +404,9 @@ function inputFor(f, current) {
   return { el: i, read: () => i.value };
 }
 
-function signatureInput(f, current) {
-  let mode = current?.kind === 'typed' ? 'type' : 'draw';
+function signatureInput(f, current, { typed = false } = {}) {
+  // Read-aloud opens on Type with the name already in, so one tap on Save adopts it.
+  let mode = current?.kind === 'typed' || (typed && !current?.png) ? 'type' : 'draw';
   const initials = f.type === 'initials';
   const defaultText = initials
     ? S.session.signer.name
@@ -439,9 +459,9 @@ function signatureInput(f, current) {
   };
 }
 
-function openField(f, { chain = false } = {}) {
+function openField(f, { chain = false, typed = false, prefill, onClose } = {}) {
   const index = S.mine.findIndex((x) => x.n === f.n) + 1;
-  const input = inputFor(f, S.answers[f.n]);
+  const input = inputFor(f, prefill ?? S.answers[f.n], { typed });
   const err = h('p', { class: 'error', role: 'alert', text: S.errors[f.n] || '' });
   const prompt = f.label || FIELD_TYPES[f.type].prompt;
   const save = async () => {
@@ -467,6 +487,7 @@ function openField(f, { chain = false } = {}) {
       h('button', { class: 'btn', type: 'button', onclick: () => (input.cleanup?.(), closeSheet()) }, 'Cancel'),
       h('button', { class: 'btn primary', type: 'button', onclick: save }, chain ? 'Save and next' : 'Save'),
     ],
+    { onClose },
   );
   sheet.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && e.target.tagName === 'INPUT' && e.target.type !== 'checkbox') {
@@ -474,6 +495,142 @@ function openField(f, { chain = false } = {}) {
       save();
     }
   });
+}
+
+// ---------- read it out loud (Thomas, 2026-10-27: he has a reading and writing disability) ----------
+
+function stopReading() {
+  if (S.reader && S.reader.state !== 'idle') S.reader.stop();
+}
+
+function openReadAloud() {
+  if (S.reader && S.reader.state !== 'idle') return;
+  const talk = Boolean(S.session.voice) && VOICE.canRecord;
+  const points = [
+    'It reads the whole document to you, from the top.',
+    talk ? 'When it gets to one of your boxes, it stops, tells you what goes there, and beeps.' : 'When it gets to one of your boxes, it stops so you can type your answer.',
+    talk ? 'Be ready to talk when it pauses. After the beep, say your answer. When you stop talking for 2 seconds, it writes your answer in the box, says it back to you, and keeps reading.' : null,
+    talk ? 'Say "skip" to leave a box for later, or "stop" to pause.' : null,
+    talk ? 'A quiet spot works best. It filters out background noise, but it hears you best up close.' : null,
+    `Turn your volume up.${VOICE.ios ? ' On iPhone, turn off Silent Mode.' : ''}`,
+    talk ? 'Your phone asks to use the microphone the first time. Tap Allow.' : null,
+  ].filter(Boolean);
+  const actions = [h('button', { class: 'btn', type: 'button', onclick: closeSheet }, 'Not now')];
+  if (S.voicePos > 0) actions.push(h('button', { class: 'btn', type: 'button', onclick: () => beginReading(0, talk) }, 'Start from the top'));
+  actions.push(h('button', { class: 'btn gold', type: 'button', onclick: () => beginReading(S.voicePos, talk) }, S.voicePos > 0 ? 'Keep going' : 'Start reading'));
+  openSheet(talk ? 'Get ready to talk' : 'Read it out loud', h('ul', { class: 'voice-steps' }, ...points.map((p) => h('li', { text: p }))), actions);
+}
+
+// Runs inside the tap: sound only unlocks on a phone if the first words are spoken right here.
+function beginReading(from, talk) {
+  closeSheet();
+  S.started = true;
+  S.view = 'text';
+  showMain({ keepScroll: true });
+  VOICE.prime(from > 0 ? 'Okay, picking up where we stopped.' : 'Okay. Here we go.');
+  (async () => {
+    let canListen = talk;
+    if (talk) canListen = (await VOICE.checkMic()).ok;
+    const docEl = document.getElementById('doc');
+    if (!docEl) return;
+    const isMine = (n) => S.mine.some((f) => f.n === n);
+    const steps = buildScript(docEl, { isMine, describeOther });
+    S.reader = createReadAloud({
+      steps,
+      engine: VOICE,
+      ops: {
+        canListen,
+        today: S.session.today,
+        field: (n) => S.mine.find((f) => f.n === n),
+        value: (f) => (f.type === 'date' && !f.allowChange ? S.session.today : S.answers[f.n]),
+        fill: voiceFill,
+        panel: (f, opts) => new Promise((resolve) => openField(f, { ...opts, onClose: resolve })),
+        transcribe,
+        highlight: voiceHighlight,
+        focus: voiceFocus,
+        finishText: () => (allRequiredDone() ? `Tap the gold button at the bottom, ${finishLabel()}, to sign.` : 'Some boxes still need you. Tap Next at the bottom to go to them.'),
+        onEnd: (pos) => {
+          S.voicePos = pos >= steps.length ? 0 : pos;
+          stickyBar();
+        },
+      },
+    });
+    S.reader.start(from);
+  })();
+}
+
+// What the voice says for a box that belongs to someone else.
+function describeOther(n) {
+  const f = S.session.document.fields.find((x) => x.n === n);
+  if (!f) return '';
+  const v = mergedValues()[n];
+  if (f.role === SENDER_ROLE) return displayValue(f, v);
+  if (isImageType(f.type)) return v?.png ? `signed by the ${f.role}` : `the ${f.role} signs here`;
+  // The type name, not the label: a label like "Your printed name" is written for that other signer.
+  return displayValue(f, v) || `the ${f.role}'s ${FIELD_TYPES[f.type].label.toLowerCase()} goes here`;
+}
+
+// Writes a spoken answer into the box the same way typing would, so the draft, the check and the counter all update.
+function voiceFill(f, raw) {
+  const el = document.querySelector(`#doc [data-n="${f.n}"]`);
+  const input = el?.querySelector('input, textarea');
+  const fire = (type) => input.dispatchEvent(new window.Event(type, { bubbles: true }));
+  if (f.type === 'checkbox') {
+    if (input) {
+      input.checked = raw === true;
+      fire('change');
+    } else {
+      S.answers[f.n] = raw === true;
+      changed(f);
+    }
+    return { ok: true, value: raw === true };
+  }
+  const check = validateValue(f, raw);
+  if (input && f.type !== 'address') {
+    input.value = check.ok && check.value !== null ? String(check.value) : typeof raw === 'string' ? raw : '';
+    fire('input');
+    fire('change');
+    return check;
+  }
+  if (check.ok) {
+    S.answers[f.n] = check.value;
+    delete S.errors[f.n];
+    changed(f);
+    showMain({ keepScroll: true });
+  }
+  return check;
+}
+
+async function transcribe(heard, f) {
+  const wav = await toWav16k(heard.blob);
+  const audio_b64 = await blobToBase64(wav || heard.blob);
+  const r = await api('POST', '/api/sign/voice', { signToken: token, body: { n: f.n, audio_b64, mime: wav ? 'audio/wav' : heard.blob.type } });
+  return String(r.text || '');
+}
+
+let lastVoiceBlock = -1;
+function voiceHighlight(step) {
+  for (const el of document.querySelectorAll('#doc .voice-now, #doc .voice-box')) el.classList.remove('voice-now', 'voice-box');
+  if (!step) {
+    lastVoiceBlock = -1;
+    return;
+  }
+  const block = document.getElementById('doc')?.children[step.block];
+  if (!block) return;
+  block.classList.add('voice-now');
+  const box = step.kind === 'field' ? document.querySelector(`#doc [data-n="${step.n}"]`) : null;
+  box?.classList.add('voice-box');
+  if (box || step.block !== lastVoiceBlock) (box || block).scrollIntoView?.({ block: 'center', behavior: 'smooth' });
+  lastVoiceBlock = step.block;
+}
+
+// keyboard: false only shows the box (talking); true puts the cursor in it (typing).
+function voiceFocus(f, { keyboard = true } = {}) {
+  const el = document.querySelector(`#doc [data-n="${f.n}"]`);
+  if (!el) return;
+  el.scrollIntoView?.({ block: 'center', behavior: 'smooth' });
+  const input = el.querySelector('input, textarea');
+  if (keyboard && input && input.type !== 'checkbox') input.focus?.({ preventScroll: true });
 }
 
 // ---------- finish: consent, sign, send on ----------
@@ -492,13 +649,19 @@ function openFinish() {
     btn.disabled = !consentBox.checked;
   });
   btn.addEventListener('click', () => submit(btn, err, label));
-  openSheet(label, h('div', {}, h('p', { text: whatHappensNext() }), h('label', { class: 'consent', for: 'consent' }, consentBox, h('span', { text: S.session.consent.text })), err), [
-    h('button', { class: 'btn', type: 'button', onclick: closeSheet }, 'Back'),
-    btn,
-  ]);
+  const readIt = VOICE.supported
+    ? h('button', { class: 'btn small', type: 'button', onclick: () => VOICE.sayNow(`${whatHappensNext()} The box says: ${S.session.consent.text} Tick it, then tap ${label}.`) }, 'Read this to me')
+    : null;
+  openSheet(
+    label,
+    h('div', {}, h('p', { text: whatHappensNext() }), readIt, h('label', { class: 'consent', for: 'consent' }, consentBox, h('span', { text: S.session.consent.text })), err),
+    [h('button', { class: 'btn', type: 'button', onclick: closeSheet }, 'Back'), btn],
+    { onClose: () => VOICE.cancel() },
+  );
 }
 
 async function submit(btn, err, label) {
+  stopReading();
   btn.disabled = true;
   btn.textContent = 'Signing...';
   err.textContent = '';

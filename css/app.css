@@ -1056,3 +1056,128 @@ h2 {
   white-space: normal;
   line-height: 1.2;
 }
+
+/* ---------- read it out loud (signer page) ---------- */
+
+[hidden] {
+  display: none !important;
+}
+
+.voice-start {
+  margin: 14px 0 6px;
+}
+
+.voice-start .btn {
+  width: 100%;
+  min-height: 56px;
+  font-size: 18px;
+}
+
+.voice-steps {
+  margin: 0;
+  padding-left: 22px;
+  font-size: 17px;
+  line-height: 1.5;
+}
+
+.voice-steps li + li {
+  margin-top: 8px;
+}
+
+body.voice-on .sticky-bar {
+  display: none;
+}
+
+.voice-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 40;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+  background: var(--navy);
+  color: #fff;
+  box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.2);
+}
+
+.voice-bar[data-mode='listening'] {
+  background: #14532d;
+}
+
+.voice-bar[data-mode='paused'] .voice-info {
+  flex-basis: 100%;
+}
+
+.voice-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.voice-status {
+  display: block;
+  font-weight: 700;
+  font-size: 16px;
+  line-height: 1.3;
+}
+
+.voice-meter {
+  display: block;
+  height: 8px;
+  margin-top: 6px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.22);
+  overflow: hidden;
+}
+
+.voice-meter span {
+  display: block;
+  width: 4%;
+  height: 100%;
+  background: var(--gold);
+  transition: width 60ms linear;
+}
+
+.voice-bar .btn {
+  min-height: 44px;
+  padding: 8px 14px;
+}
+
+.voice-bar .btn.icon {
+  background: transparent;
+  border-color: rgba(255, 255, 255, 0.45);
+  color: #fff;
+}
+
+.voice-bar .btn.primary {
+  background: #fff;
+  border-color: #fff;
+  color: var(--navy);
+}
+
+.reader .voice-now {
+  background: color-mix(in srgb, var(--gold) 16%, transparent);
+  box-shadow: 0 0 0 6px color-mix(in srgb, var(--gold) 16%, transparent);
+  border-radius: 4px;
+}
+
+.fchip.voice-box {
+  outline: 3px solid var(--gold);
+  outline-offset: 3px;
+  animation: voice-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes voice-pulse {
+  50% {
+    outline-color: color-mix(in srgb, var(--gold) 35%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fchip.voice-box {
+    animation: none;
+  }
+}
